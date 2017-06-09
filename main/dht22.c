@@ -32,15 +32,14 @@
  *
  */
 
-#include <stdio.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "driver/gpio.h"
-#include "sdkconfig.h"
-/*#include "dht22.h"*/
+#include "dht22.h"
 
-int DHT_GPIO = 26;
+int DHT_GPIO = 24;
 int timeout;
+int time_diff = -MIN_TIME;
+int data[2] = {0};
+
+static const char *TAG = "DHT sensor";
 
 void pulse_init()
 {
@@ -54,9 +53,9 @@ void pulse_init()
     gpio_set_direction(DHT_GPIO, GPIO_MODE_INPUT);
 }
 
-int checksum(int *data)
+int checksum(int *cdata)
 {
-    return (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF));
+    return (cdata[4] == ((cdata[0] + cdata[1] + cdata[2] + cdata[3]) & 0xFF));
 }
 
 void set_DHT_pin(int pin){
@@ -76,66 +75,94 @@ int wait_change_level(int level, int time)
     return cpt;
 }
 
-float * get_data()
+int read_data()
 {
-    int i, val[80] = {0}, bytes[5] = {0}, data[2]={0};
+    int i, val[80] = {0}, err, bytes[5] = {0};
     char out[40] = {0};
     timeout = 0;
 
-    portMUX_TYPE my_spinlock = portMUX_INITIALIZER_UNLOCKED;
+    struct timeval now;
+    gettimeofday(&now, NULL);
 
-    portENTER_CRITICAL(&my_spinlock); // timing critical start
-    {
-        // Init sequence MCU side: pulse and wait
-        pulse_init();
-        ets_delay_us(10);
+    if(now.tv_sec - time_diff < MIN_TIME)
+        return SUCCESS;
+    else{
+        gpio_pad_select_gpio(DHT_GPIO);
 
-        // DHT22 sending init sequence(high/low/high)
-        wait_change_level(1, 40);
-        wait_change_level(0, 80);
-        wait_change_level(1, 80);
+        portMUX_TYPE my_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
-        // And now the reading adventure begins
-        for (i = 0; i < 80; i += 2) {
+        portENTER_CRITICAL(&my_spinlock); // timing critical start
+        {
+            // Init sequence MCU side: pulse and wait
+            pulse_init();
+            ets_delay_us(10);
 
-            val[i] = wait_change_level(0, 80);
-            val[i+1] = wait_change_level(1, 80);
+            // DHT22 sending init sequence(high/low/high)
+            wait_change_level(1, 40);
+            wait_change_level(0, 80);
+            wait_change_level(1, 80);
+
+            // And now the reading adventure begins
+            for (i = 0; i < 80; i += 2)
+            {
+                val[i] = wait_change_level(0, 80);
+                val[i+1] = wait_change_level(1, 80);
+            }
         }
+        portEXIT_CRITICAL(&my_spinlock); // timing critical end
+
+        for (i = 2; i < 80; i+=2)
+            out[i/2] = (val[i] < val[i+1]) ? 1 : 0;
+
+        for (i = 0; i < 40; ++i) {
+            bytes[i/8] <<= 1;
+            bytes[i/8] |= out[i];
+        }
+
+        if(timeout)
+        {
+            ESP_LOGE(TAG, "Timeout error\n");
+            err = TIMEOUT_ERROR;
+        }
+        else if(!checksum(bytes))
+        {
+            ESP_LOGE(TAG, "Checksum error\n");
+            err = CHECKSUM_ERROR;
+        }
+        else
+        {
+            for (i = 0; i < 2; ++i)
+                data[i] = (bytes[2*i] << 8) + bytes[2*i+1];
+
+            gettimeofday(&now, NULL);
+            time_diff = now.tv_sec;
+            err = SUCCESS;
+        }
+
+        return err;
     }
-    portEXIT_CRITICAL(&my_spinlock); // timing critical end
-
-    for (i = 2; i < 80; i+=2)
-        out[i/2] = (val[i] < val[i+1]) ? 1 : 0;
-
-    for (i = 0; i < 40; ++i) {
-        bytes[i/8] <<= 1;
-        bytes[i/8] |= out[i];
-    }
-
-    if(timeout)
-        printf("%s\n", "Timeout error");
-    else if(!checksum(bytes))
-        printf("%s\n", "Checksum error");
-    else
-    {
-        for (i = 0; i < 2; ++i)
-            data[i] = (bytes[2*i] << 8) + bytes[2*i+1];
-
-        printf("hum: %d\n", data[0]);
-        printf("temp: %d\n", data[1]);
-    }
-    return 0;
 }
-void read_task(void *pvParameter)
+
+
+float get_hum()
 {
-    gpio_pad_select_gpio(DHT_GPIO);
-    while (1) {
-        get_data();
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
-    }
+    int success = read_data();
+    return success ? (float) data[0]/10 : success;
 }
 
-void app_main()
+float get_tempc()
 {
-    xTaskCreate(&read_task, "read_task", 2048, NULL, 5, NULL);
+    int success = read_data();
+    return success ? (float) data[1]/10 : success;
+}
+
+float temp_c_to_f(float c)
+{
+    return c * 9/5 +32;
+}
+
+float get_tempf()
+{
+    int success = read_data();
+    return success ? temp_c_to_f((float) data[1]/10): success;
 }
